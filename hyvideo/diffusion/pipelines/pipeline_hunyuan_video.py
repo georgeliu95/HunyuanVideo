@@ -23,6 +23,9 @@ import torch.distributed as dist
 import numpy as np
 from dataclasses import dataclass
 from packaging import version
+import nvtx
+import os
+
 
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.configuration_utils import FrozenDict
@@ -42,6 +45,8 @@ from diffusers.utils import (
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.utils import BaseOutput
+
+from xfuser.core.distributed import get_sequence_parallel_world_size
 
 from ...constants import PRECISION_TO_TYPE
 from ...vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
@@ -835,7 +840,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         else:
             batch_size = prompt_embeds.shape[0]
 
-        device = torch.device(f"cuda:{dist.get_rank()}") if dist.is_initialized() else self._execution_device
+        device = torch.device(f"cuda:{os.environ.get('LOCAL_RANK', 0)}") if dist.is_initialized() else self._execution_device
 
         # 3. Encode input prompt
         lora_scale = (
@@ -844,6 +849,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             else None
         )
 
+        encode_prompt_rng = nvtx.start_range(message="encode_prompt", color="red")
         (
             prompt_embeds,
             negative_prompt_embeds,
@@ -863,6 +869,9 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             clip_skip=self.clip_skip,
             data_type=data_type,
         )
+        nvtx.end_range(encode_prompt_rng)
+
+        encode_prompt_2_rng = nvtx.start_range(message="encode_prompt_2", color="red")
         if self.text_encoder_2 is not None:
             (
                 prompt_embeds_2,
@@ -889,6 +898,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             negative_prompt_embeds_2 = None
             prompt_mask_2 = None
             negative_prompt_mask_2 = None
+        nvtx.end_range(encode_prompt_2_rng)
 
         # For classifier free guidance, we need to do two forward passes.
         # Here we concatenate the unconditional and text embeddings into a single batch
@@ -903,6 +913,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                 prompt_mask_2 = torch.cat([negative_prompt_mask_2, prompt_mask_2])
 
 
+        prepare_timesteps_rng = nvtx.start_range(message="prepare_timesteps", color="red")
         # 4. Prepare timesteps
         extra_set_timesteps_kwargs = self.prepare_extra_func_kwargs(
             self.scheduler.set_timesteps, {"n_tokens": n_tokens}
@@ -915,7 +926,9 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             sigmas,
             **extra_set_timesteps_kwargs,
         )
+        nvtx.end_range(prepare_timesteps_rng)
 
+        prepare_latents_rng = nvtx.start_range(message="prepare_latents", color="red")
         if "884" in vae_ver:
             video_length = (video_length - 1) // 4 + 1
         elif "888" in vae_ver:
@@ -936,13 +949,17 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             generator,
             latents,
         )
+        nvtx.end_range(prepare_latents_rng)
 
+        prepare_extra_step_kwargs_rng = nvtx.start_range(message="prepare_extra_step_kwargs", color="red")
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_func_kwargs(
             self.scheduler.step,
             {"generator": generator, "eta": eta},
         )
+        nvtx.end_range(prepare_extra_step_kwargs_rng)
 
+        prepare_target_dtype_rng = nvtx.start_range(message="prepare_target_dtype", color="red")
         target_dtype = PRECISION_TO_TYPE[self.args.precision]
         autocast_enabled = (
             target_dtype != torch.float32
@@ -951,17 +968,42 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         vae_autocast_enabled = (
             vae_dtype != torch.float32
         ) and not self.args.disable_autocast
+        nvtx.end_range(prepare_target_dtype_rng)
 
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
+        ref_cu_seqlens_q = None
+        if kwargs.get("optimize_memcpy", False):
+            # [Optional] Prepare cu_seqlens_q
+            if n_tokens is not None:
+                from hyvideo.modules.attenion import get_cu_seqlens
+                get_cu_seqlens_rng = nvtx.start_range(message="get_cu_seqlens", color="red")
+                # Compute cu_squlens and max_seqlen for flash attention
+                if dist.is_initialized():
+                    ref_cu_seqlens_q = get_cu_seqlens(text_mask=prompt_mask, img_len=n_tokens // get_sequence_parallel_world_size())
+                else:
+                    ref_cu_seqlens_q = get_cu_seqlens(text_mask=prompt_mask, img_len=n_tokens)
+                host_seqlens_q = ref_cu_seqlens_q.cpu()
+                nvtx.end_range(get_cu_seqlens_rng)
+            # [Optional] Copy freqs_cis to the device of the transformer
+            if isinstance(freqs_cis, tuple):
+                freqs_cis = (freqs_cis[0].to(device), freqs_cis[1].to(device))
+            elif isinstance(freqs_cis, torch.Tensor):
+                freqs_cis = freqs_cis.to(device)
+
         # if is_progress_bar:
+        monitor_window_rng = None
+        monitor_window_step_range = [3, 6]
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
 
+                if monitor_window_rng is None and i == monitor_window_step_range[0]:
+                    monitor_window_rng = nvtx.start_range(message="monitor_window", color="blue")
+                denoising_loop_rng = nvtx.start_range(message=f"denoising_loop_{i}", color="red")
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = (
                     torch.cat([latents] * 2)
@@ -997,6 +1039,8 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         freqs_cos=freqs_cis[0],  # [seqlen, head_dim]
                         freqs_sin=freqs_cis[1],  # [seqlen, head_dim]
                         guidance=guidance_expand,
+                        ref_cu_seqlens_q=ref_cu_seqlens_q,
+                        host_seqlens_q=host_seqlens_q,
                         return_dict=True,
                     )[
                         "x"
@@ -1044,7 +1088,16 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
 
+                nvtx.end_range(denoising_loop_rng)
+                if monitor_window_rng is not None and i == monitor_window_step_range[1]:
+                    nvtx.end_range(monitor_window_rng)
+                    monitor_window_rng = None
+        if monitor_window_rng is not None:
+            nvtx.end_range(monitor_window_rng)
+
+        decode_latents_rng = nvtx.start_range(message="decode_latents", color="red")
         if not output_type == "latent":
+            torch.cuda.empty_cache()
             expand_temporal_dim = False
             if len(latents.shape) == 4:
                 if isinstance(self.vae, AutoencoderKLCausal3D):
@@ -1086,6 +1139,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
 
         else:
             image = latents
+        nvtx.end_range(decode_latents_rng)
 
         image = (image / 2 + 0.5).clamp(0, 1)
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16

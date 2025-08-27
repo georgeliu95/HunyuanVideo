@@ -13,6 +13,10 @@ except ImportError:
     flash_attn = None
     flash_attn_varlen_func = None
     _flash_attn_forward = None
+try:
+    from flash_attn_interface import flash_attn_varlen_func as flash_attn3_varlen_func
+except ImportError:
+    flash_attn3_varlen_func = None
 
 
 MEMORY_LAYOUT = {
@@ -45,8 +49,7 @@ def get_cu_seqlens(text_mask, img_len):
     text_len = text_mask.sum(dim=1)
     max_len = text_mask.shape[1] + img_len
 
-    cu_seqlens = torch.zeros([2 * batch_size + 1], dtype=torch.int32, device="cuda")
-
+    cu_seqlens = torch.zeros([2 * batch_size + 1], dtype=torch.int32, device=text_len.device)
     for i in range(batch_size):
         s = text_len[i] + img_len
         s1 = i * max_len + s
@@ -104,6 +107,20 @@ def attention(
         x = F.scaled_dot_product_attention(
             q, k, v, attn_mask=attn_mask, dropout_p=drop_rate, is_causal=causal
         )
+    elif mode == "flash_attn3":
+        x = flash_attn3_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            max_seqlen_q,
+            max_seqlen_kv,
+        )
+        # x with shape [(bxs), a, d]
+        x = x.view(
+            batch_size, max_seqlen_q, x.shape[-2], x.shape[-1]
+        )  # reshape x to [b, s, a, d]
     elif mode == "flash":
         x = flash_attn_varlen_func(
             q,

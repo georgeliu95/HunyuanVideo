@@ -1,5 +1,6 @@
 from typing import Any, List, Tuple, Optional, Union, Dict
 from einops import rearrange
+import nvtx
 
 import torch
 import torch.nn as nn
@@ -252,6 +253,203 @@ class MMDoubleStreamBlock(nn.Module):
         return img, txt
 
 
+class MMDoubleStreamBlockNoMod(nn.Module):
+    """
+    A multimodal dit block without img_mod and txt_mod modulation modules
+    基于MMDoubleStreamBlock但移除了img_mod和txt_mod调制模块
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        heads_num: int,
+        mlp_width_ratio: float,
+        mlp_act_type: str = "gelu_tanh",
+        qk_norm: bool = True,
+        qk_norm_type: str = "rms",
+        qkv_bias: bool = False,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.device] = None,
+    ):
+        factory_kwargs = {"device": device, "dtype": dtype}
+        super().__init__()
+
+        self.deterministic = False
+        self.heads_num = heads_num
+        head_dim = hidden_size // heads_num
+        mlp_hidden_dim = int(hidden_size * mlp_width_ratio)
+
+        # 图像分支 - 移除了img_mod
+        self.img_norm1 = nn.LayerNorm(
+            hidden_size, elementwise_affine=True, eps=1e-6, **factory_kwargs  # 改为True因为没有modulation
+        )
+
+        self.img_attn_qkv = nn.Linear(
+            hidden_size, hidden_size * 3, bias=qkv_bias, **factory_kwargs
+        )
+        qk_norm_layer = get_norm_layer(qk_norm_type)
+        self.img_attn_q_norm = (
+            qk_norm_layer(head_dim, elementwise_affine=True, eps=1e-6, **factory_kwargs)
+            if qk_norm
+            else nn.Identity()
+        )
+        self.img_attn_k_norm = (
+            qk_norm_layer(head_dim, elementwise_affine=True, eps=1e-6, **factory_kwargs)
+            if qk_norm
+            else nn.Identity()
+        )
+        self.img_attn_proj = nn.Linear(
+            hidden_size, hidden_size, bias=qkv_bias, **factory_kwargs
+        )
+
+        self.img_norm2 = nn.LayerNorm(
+            hidden_size, elementwise_affine=True, eps=1e-6, **factory_kwargs  # 改为True因为没有modulation
+        )
+        self.img_mlp = MLP(
+            hidden_size,
+            mlp_hidden_dim,
+            act_layer=get_activation_layer(mlp_act_type),
+            bias=True,
+            **factory_kwargs,
+        )
+
+        # 文本分支 - 移除了txt_mod
+        self.txt_norm1 = nn.LayerNorm(
+            hidden_size, elementwise_affine=True, eps=1e-6, **factory_kwargs  # 改为True因为没有modulation
+        )
+
+        self.txt_attn_qkv = nn.Linear(
+            hidden_size, hidden_size * 3, bias=qkv_bias, **factory_kwargs
+        )
+        self.txt_attn_q_norm = (
+            qk_norm_layer(head_dim, elementwise_affine=True, eps=1e-6, **factory_kwargs)
+            if qk_norm
+            else nn.Identity()
+        )
+        self.txt_attn_k_norm = (
+            qk_norm_layer(head_dim, elementwise_affine=True, eps=1e-6, **factory_kwargs)
+            if qk_norm
+            else nn.Identity()
+        )
+        self.txt_attn_proj = nn.Linear(
+            hidden_size, hidden_size, bias=qkv_bias, **factory_kwargs
+        )
+
+        self.txt_norm2 = nn.LayerNorm(
+            hidden_size, elementwise_affine=True, eps=1e-6, **factory_kwargs  # 改为True因为没有modulation
+        )
+        self.txt_mlp = MLP(
+            hidden_size,
+            mlp_hidden_dim,
+            act_layer=get_activation_layer(mlp_act_type),
+            bias=True,
+            **factory_kwargs,
+        )
+        self.hybrid_seq_parallel_attn = None
+
+    def enable_deterministic(self):
+        self.deterministic = True
+
+    def disable_deterministic(self):
+        self.deterministic = False
+
+    def forward(
+        self,
+        img: torch.Tensor,
+        txt: torch.Tensor,
+        vec: torch.Tensor,  # 保留vec参数但不使用，保持接口一致性
+        cu_seqlens_q: Optional[torch.Tensor] = None,
+        cu_seqlens_kv: Optional[torch.Tensor] = None,
+        host_seqlens_q: Optional[torch.Tensor] = None,
+        host_seqlens_kv: Optional[torch.Tensor] = None,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_kv: Optional[int] = None,
+        freqs_cis: tuple = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        img_qkv_rng = nvtx.start_range(message="img_qkv", color="green")
+        # 图像分支处理 - 不使用modulation
+        img_modulated = self.img_norm1(img)  # 直接normalization，不使用modulate
+        img_qkv = self.img_attn_qkv(img_modulated)
+        img_q, img_k, img_v = rearrange(
+            img_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
+        )
+        nvtx.end_range(img_qkv_rng)
+        img_qk_norm_rng = nvtx.start_range(message="img_qk_norm", color="green")
+        # Apply QK-Norm if needed
+        img_q = self.img_attn_q_norm(img_q).to(img_v)
+        img_k = self.img_attn_k_norm(img_k).to(img_v)
+        nvtx.end_range(img_qk_norm_rng)
+        img_rope_rng = nvtx.start_range(message="img_rope", color="green")
+        # Apply RoPE if needed.
+        if freqs_cis is not None:
+            img_qq, img_kk = apply_rotary_emb(img_q, img_k, freqs_cis, head_first=False)
+            assert (
+                img_qq.shape == img_q.shape and img_kk.shape == img_k.shape
+            ), f"img_kk: {img_qq.shape}, img_q: {img_q.shape}, img_kk: {img_kk.shape}, img_k: {img_k.shape}"
+            img_q, img_k = img_qq, img_kk
+        nvtx.end_range(img_rope_rng)
+        txt_qkv_rng = nvtx.start_range(message="txt_qkv", color="green")
+        # 文本分支处理 - 不使用modulation
+        txt_modulated = self.txt_norm1(txt)  # 直接normalization，不使用modulate
+        txt_qkv = self.txt_attn_qkv(txt_modulated)
+        txt_q, txt_k, txt_v = rearrange(
+            txt_qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num
+        )
+        nvtx.end_range(txt_qkv_rng)
+        txt_qk_norm_rng = nvtx.start_range(message="txt_qk_norm", color="green")
+        # Apply QK-Norm if needed.
+        txt_q = self.txt_attn_q_norm(txt_q).to(txt_v)
+        txt_k = self.txt_attn_k_norm(txt_k).to(txt_v)
+        nvtx.end_range(txt_qk_norm_rng)
+        # Run actual attention.
+        q = torch.cat((img_q, txt_q), dim=1)
+        k = torch.cat((img_k, txt_k), dim=1)
+        v = torch.cat((img_v, txt_v), dim=1)
+        assert (
+            host_seqlens_q.shape[0] == 2 * img.shape[0] + 1
+        ), f"host_seqlens_q.shape:{host_seqlens_q.shape}, img.shape[0]:{img.shape[0]}"
+        
+        attn_rng = nvtx.start_range(message="attn", color="green")
+        # attention computation start
+        if not self.hybrid_seq_parallel_attn:
+            attn = attention(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_kv=cu_seqlens_kv,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_kv,
+                batch_size=img_k.shape[0],
+            )
+        else:
+            attn = parallel_attention(
+                self.hybrid_seq_parallel_attn,
+                q,
+                k,
+                v,
+                img_q_len=img_q.shape[1],
+                img_kv_len=img_k.shape[1],
+                cu_seqlens_q=host_seqlens_q,
+                cu_seqlens_kv=host_seqlens_kv
+            )    
+        # attention computation end
+        nvtx.end_range(attn_rng)
+
+        img_attn, txt_attn = attn[:, : img.shape[1]], attn[:, img.shape[1] :]
+
+        proj_rng = nvtx.start_range(message="proj", color="green")
+        # 计算图像块 - 不使用gate和modulation
+        img = img + self.img_attn_proj(img_attn)  # 直接残差连接
+        img = img + self.img_mlp(self.img_norm2(img))  # 直接残差连接
+
+        # 计算文本块 - 不使用gate和modulation  
+        txt = txt + self.txt_attn_proj(txt_attn)  # 直接残差连接
+        txt = txt + self.txt_mlp(self.txt_norm2(txt))  # 直接残差连接
+        nvtx.end_range(proj_rng)
+        return img, txt
+
+
 class MMSingleStreamBlock(nn.Module):
     """
     A DiT block with parallel linear layers as described in
@@ -330,22 +528,28 @@ class MMSingleStreamBlock(nn.Module):
         txt_len: int,
         cu_seqlens_q: Optional[torch.Tensor] = None,
         cu_seqlens_kv: Optional[torch.Tensor] = None,
+        host_seqlens_q: Optional[torch.Tensor] = None,
+        host_seqlens_kv: Optional[torch.Tensor] = None,
         max_seqlen_q: Optional[int] = None,
         max_seqlen_kv: Optional[int] = None,
         freqs_cis: Tuple[torch.Tensor, torch.Tensor] = None,
     ) -> torch.Tensor:
+        mod_rng = nvtx.start_range(message="mod", color="green")
         mod_shift, mod_scale, mod_gate = self.modulation(vec).chunk(3, dim=-1)
         x_mod = modulate(self.pre_norm(x), shift=mod_shift, scale=mod_scale)
         qkv, mlp = torch.split(
             self.linear1(x_mod), [3 * self.hidden_size, self.mlp_hidden_dim], dim=-1
         )
+        nvtx.end_range(mod_rng)
 
         q, k, v = rearrange(qkv, "B L (K H D) -> K B L H D", K=3, H=self.heads_num)
 
+        qk_norm_rng = nvtx.start_range(message="qk_norm", color="green")
         # Apply QK-Norm if needed.
         q = self.q_norm(q).to(v)
         k = self.k_norm(k).to(v)
-
+        nvtx.end_range(qk_norm_rng)
+        q_rope_rng = nvtx.start_range(message="q_rope", color="green")
         # Apply RoPE if needed.
         if freqs_cis is not None:
             img_q, txt_q = q[:, :-txt_len, :, :], q[:, -txt_len:, :, :]
@@ -357,11 +561,12 @@ class MMSingleStreamBlock(nn.Module):
             img_q, img_k = img_qq, img_kk
             q = torch.cat((img_q, txt_q), dim=1)
             k = torch.cat((img_k, txt_k), dim=1)
-
+        nvtx.end_range(q_rope_rng)
+        attn_rng = nvtx.start_range(message="attn", color="green")
         # Compute attention.
         assert (
-            cu_seqlens_q.shape[0] == 2 * x.shape[0] + 1
-        ), f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, x.shape[0]:{x.shape[0]}"
+            host_seqlens_q.shape[0] == 2 * x.shape[0] + 1
+        ), f"host_seqlens_q.shape:{host_seqlens_q.shape}, x.shape[0]:{x.shape[0]}"
         
         # attention computation start
         if not self.hybrid_seq_parallel_attn:
@@ -383,13 +588,15 @@ class MMSingleStreamBlock(nn.Module):
                 v,
                 img_q_len=img_q.shape[1],
                 img_kv_len=img_k.shape[1],
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_kv=cu_seqlens_kv
+                cu_seqlens_q=host_seqlens_q,
+                cu_seqlens_kv=host_seqlens_kv
             )
         # attention computation end
-
+        nvtx.end_range(attn_rng)
+        mlp_rng = nvtx.start_range(message="mlp", color="green")
         # Compute activation in mlp stream, cat again and run second linear layer.
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
+        nvtx.end_range(mlp_rng)
         return x + apply_gate(output, gate=mod_gate)
 
 
@@ -467,6 +674,8 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         use_attention_mask: bool = True,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
+        *aargs,
+        **kwargs,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -539,10 +748,13 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             else None
         )
 
-        # double blocks
+        # double blocks - 根据配置选择是否使用无调制版本
+        use_no_mod_blocks = HUNYUAN_VIDEO_CONFIG[args.model].get('use_no_mod_blocks', False)
+        DoubleStreamBlockClass = MMDoubleStreamBlockNoMod if use_no_mod_blocks else MMDoubleStreamBlock
+        
         self.double_blocks = nn.ModuleList(
             [
-                MMDoubleStreamBlock(
+                DoubleStreamBlockClass(
                     self.hidden_size,
                     self.heads_num,
                     mlp_width_ratio=mlp_width_ratio,
@@ -602,6 +814,8 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         freqs_cos: Optional[torch.Tensor] = None,
         freqs_sin: Optional[torch.Tensor] = None,
         guidance: torch.Tensor = None,  # Guidance for modulation, should be cfg_scale x 1000.
+        ref_cu_seqlens_q: Optional[torch.Tensor] = None,
+        host_seqlens_q: Optional[torch.Tensor] = None,
         return_dict: bool = True,
     ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
         out = {}
@@ -615,12 +829,17 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         )
 
         # Prepare modulation vectors.
+        time_in_rng = nvtx.start_range(message="time_in", color="yellow")
         vec = self.time_in(t)
+        nvtx.end_range(time_in_rng)
 
         # text modulation
+        vector_in_rng = nvtx.start_range(message="vector_in", color="yellow")
         vec = vec + self.vector_in(text_states_2)
+        nvtx.end_range(vector_in_rng)
 
         # guidance modulation
+        guidance_in_rng = nvtx.start_range(message="guidance_in", color="yellow")
         if self.guidance_embed:
             if guidance is None:
                 raise ValueError(
@@ -629,9 +848,13 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
 
             # our timestep_embedding is merged into guidance_in(TimestepEmbedder)
             vec = vec + self.guidance_in(guidance)
+        nvtx.end_range(guidance_in_rng)
 
         # Embed image and text.
+        img_in_rng = nvtx.start_range(message="img_in", color="yellow")
         img = self.img_in(img)
+        nvtx.end_range(img_in_rng)
+        txt_in_rng = nvtx.start_range(message="txt_in", color="yellow")
         if self.text_projection == "linear":
             txt = self.txt_in(txt)
         elif self.text_projection == "single_refiner":
@@ -640,15 +863,23 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             raise NotImplementedError(
                 f"Unsupported text_projection: {self.text_projection}"
             )
+        nvtx.end_range(txt_in_rng)
 
         txt_seq_len = txt.shape[1]
         img_seq_len = img.shape[1]
 
+        get_cu_seqlens_rng = nvtx.start_range(message="get_cu_seqlens", color="yellow")
         # Compute cu_squlens and max_seqlen for flash attention
-        cu_seqlens_q = get_cu_seqlens(text_mask, img_seq_len)
+        if ref_cu_seqlens_q is None:
+            cu_seqlens_q = get_cu_seqlens(text_mask, img_seq_len)
+        else:
+            cu_seqlens_q = ref_cu_seqlens_q
         cu_seqlens_kv = cu_seqlens_q
+        host_seqlens_q = host_seqlens_q
+        host_seqlens_kv = host_seqlens_q
         max_seqlen_q = img_seq_len + txt_seq_len
         max_seqlen_kv = max_seqlen_q
+        nvtx.end_range(get_cu_seqlens_rng)
 
         freqs_cis = (freqs_cos, freqs_sin) if freqs_cos is not None else None
         # --------------------- Pass through DiT blocks ------------------------
@@ -659,12 +890,16 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                 vec,
                 cu_seqlens_q,
                 cu_seqlens_kv,
+                host_seqlens_q,
+                host_seqlens_kv,
                 max_seqlen_q,
                 max_seqlen_kv,
                 freqs_cis,
             ]
 
+            dit_block_rng = nvtx.start_range(message=f"dit_double_block_{_}", color="yellow")
             img, txt = block(*double_block_args)
+            nvtx.end_range(dit_block_rng)
 
         # Merge txt and img to pass through single stream blocks.
         x = torch.cat((img, txt), 1)
@@ -676,17 +911,22 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
                     txt_seq_len,
                     cu_seqlens_q,
                     cu_seqlens_kv,
+                    host_seqlens_q,
+                    host_seqlens_kv,
                     max_seqlen_q,
                     max_seqlen_kv,
                     (freqs_cos, freqs_sin),
                 ]
 
+                dit_block_rng = nvtx.start_range(message=f"dit_single_block_{_}", color="yellow")
                 x = block(*single_block_args)
+                nvtx.end_range(dit_block_rng)
 
         img = x[:, :img_seq_len, ...]
-
+        final_layer_rng = nvtx.start_range(message="final_layer", color="yellow")
         # ---------------------------- Final layer ------------------------------
         img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
+        nvtx.end_range(final_layer_rng)
 
         img = self.unpatchify(img, tt, th, tw)
         if return_dict:
@@ -699,6 +939,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         x: (N, T, patch_size**2 * C)
         imgs: (N, H, W, C)
         """
+        unpatchify_rng = nvtx.start_range(message="unpatchify", color="yellow")
         c = self.unpatchify_channels
         pt, ph, pw = self.patch_size
         assert t * h * w == x.shape[1]
@@ -706,10 +947,11 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
         x = x.reshape(shape=(x.shape[0], t, h, w, c, pt, ph, pw))
         x = torch.einsum("nthwcopq->nctohpwq", x)
         imgs = x.reshape(shape=(x.shape[0], c, t * pt, h * ph, w * pw))
-
+        nvtx.end_range(unpatchify_rng)
         return imgs
 
     def params_count(self):
+        params_count_rng = nvtx.start_range(message="params_count", color="yellow")
         counts = {
             "double": sum(
                 [
@@ -732,6 +974,7 @@ class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
             "total": sum(p.numel() for p in self.parameters()),
         }
         counts["attn+mlp"] = counts["double"] + counts["single"]
+        nvtx.end_range(params_count_rng)
         return counts
 
 
@@ -756,5 +999,25 @@ HUNYUAN_VIDEO_CONFIG = {
         "heads_num": 24,
         "mlp_width_ratio": 4,
         "guidance_embed": True,
+    },
+    # 用户自定义配置 - 删除img_mod和txt_mod模块的单双流2:1模式
+    "HYVideo-T/2-SingleDual-2to1-NoMod": {
+        "mm_double_blocks_depth": 20,  # 双流块：20层
+        "mm_single_blocks_depth": 40,  # 单流块：40层 (2:1比例)
+        "rope_dim_list": [16, 24, 24], # 调整rope_dim适配48个head
+        "hidden_size": 3072,
+        "heads_num": 48,               # 修改为48个注意力头
+        "mlp_width_ratio": 8.0/3,      # FFN层scale=8/3≈2.67
+        "use_no_mod_blocks": True,     # 使用无调制版本的双流块
+    },
+    # 用户自定义配置 - 删除img_mod和txt_mod模块的纯双流模式
+    "HYVideo-T/2-PureDual-NoMod": {
+        "mm_double_blocks_depth": 20,  # 只使用双流块：20层  
+        "mm_single_blocks_depth": 0,   # 不使用单流块
+        "rope_dim_list": [16, 24, 24], # 调整rope_dim适配48个head
+        "hidden_size": 3072,
+        "heads_num": 48,               # 修改为48个注意力头
+        "mlp_width_ratio": 8.0/3,      # FFN层scale=8/3≈2.67
+        "use_no_mod_blocks": True,     # 使用无调制版本的双流块
     },
 }

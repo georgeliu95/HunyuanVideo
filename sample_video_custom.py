@@ -12,6 +12,8 @@ from hyvideo.inference import HunyuanVideoSampler
 
 def main():
     args = parse_args()
+    args.prompt = "A cat walks on the grass, realistic style."
+    args.neg_prompt = "Bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, overall gray, worst quality, low quality, JPEG compression residue, ugly, incomplete, extra fingers, poorly drawn hands, poorly drawn faces, deformed, disfigured, misshapen limbs, fused fingers, still picture, messy background, three legs, many people in the background, walking backwards."
     if 'LOCAL_RANK' not in os.environ or int(os.environ['LOCAL_RANK']) == 0:
         print(args)
     models_root_path = Path(args.model_base)
