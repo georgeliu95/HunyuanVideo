@@ -60,6 +60,7 @@ def parallelize_transformer(pipe, attn_type="fa"):
         "fa3": AttnType.FA3,
         "fa": AttnType.FA,
         "torch": AttnType.TORCH,
+        "sage_auto": AttnType.SAGE_AUTO,
     }
     transformer.hybrid_attn_type = attn_map[attn_type]
 
@@ -467,6 +468,11 @@ class HunyuanVideoSampler(Inference):
         self.default_negative_prompt = NEGATIVE_PROMPT
         if self.parallel_args['ulysses_degree'] > 1 or self.parallel_args['ring_degree'] > 1:
             parallelize_transformer(self.pipeline, attn_type=args.attn_type)
+        else:
+            if args.attn_type != "fa":
+                attn_type = "flash_attn3" if args.attn_type == "fa3" else args.attn_type
+                for block in self.pipeline.transformer.double_blocks + self.pipeline.transformer.single_blocks:
+                    block.attn_type = attn_type
 
     def load_diffusion_pipeline(
         self,
@@ -698,7 +704,10 @@ class HunyuanVideoSampler(Inference):
                 guidance_scale: {guidance_scale}
                       n_tokens: {n_tokens}
                     flow_shift: {flow_shift}
-       embedded_guidance_scale: {embedded_guidance_scale}"""
+       embedded_guidance_scale: {embedded_guidance_scale}
+                     attn_type: {self.pipeline.transformer.single_blocks[0].attn_type}
+                blockwise_gemm: {self.pipeline.transformer.single_blocks[0].blockwise_gemm}"""
+       
         logger.debug(debug_str)
 
         # ========================================================================

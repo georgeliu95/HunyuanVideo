@@ -54,13 +54,20 @@ def add_network_args(parser: argparse.ArgumentParser):
         "--attn-type",
         type=str,
         default="fa",
-        choices=["fa3", "fa", "torch"],
+        choices=["fa3", "fa", "torch", "sage_auto"],
         help="Attention type.",
     )
     group.add_argument(
         "--optimize-memcpy",
         action="store_true",
         help="Optimize the memcpy for the transformer.",
+    )
+    group.add_argument(
+        "--blockwise-gemm",
+        type=str,
+        default=None,
+        choices=["fp8", "nvfp4"],
+        help="Blockwise GEMM type.",
     )
     return parser
 

@@ -24,6 +24,10 @@ MEMORY_LAYOUT = {
         lambda x: x.view(x.shape[0] * x.shape[1], *x.shape[2:]),
         lambda x: x,
     ),
+    "sage_auto": (
+        lambda x: x.transpose(1, 2),
+        lambda x: x.transpose(1, 2),
+    ),
     "torch": (
         lambda x: x.transpose(1, 2),
         lambda x: x.transpose(1, 2),
@@ -105,6 +109,11 @@ def attention(
         if attn_mask is not None and attn_mask.dtype != torch.bool:
             attn_mask = attn_mask.to(q.dtype)
         x = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, dropout_p=drop_rate, is_causal=causal
+        )
+    elif mode == "sage_auto":
+        from sageattention import sageattn
+        x = sageattn(
             q, k, v, attn_mask=attn_mask, dropout_p=drop_rate, is_causal=causal
         )
     elif mode == "flash_attn3":

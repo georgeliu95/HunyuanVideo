@@ -7,6 +7,9 @@ INFER_STEPS=$4
 MODEL=$5
 MODEL_BASE=$6
 
+ATTN_TYPE="sage_auto"
+BLOCKWISE_GEMM="fp8"
+
 # 设置默认值
 if [ -z "$INFER_STEPS" ]; then
     INFER_STEPS=5
@@ -48,9 +51,13 @@ CMD="torchrun --nproc_per_node=${NGPU} sample_video_custom.py \
     --skip-load-model \
     --warmup \
     --optimize-memcpy \
+    --attn-type ${ATTN_TYPE} \
     --model ${MODEL} \
     --model-base ${MODEL_BASE} \
     --dit-weight ${MODEL_BASE}/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states.pt"
+if [ -n "${BLOCKWISE_GEMM}" ]; then
+    CMD="${CMD} --blockwise-gemm ${BLOCKWISE_GEMM}"
+fi
 echo "正在执行命令: "
 echo $CMD
 eval $CMD

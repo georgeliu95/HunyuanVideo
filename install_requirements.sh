@@ -12,3 +12,6 @@ python -m pip install git+https://github.com/georgeliu95/xDiT.git@dev_hunyuanvid
 python -m pip install scikit-learn
 python -m pip install seaborn
 python -m pip install k_means_constrained
+python -m pip install git+https://github.com/thu-ml/SageAttention.git
+pip install --extra-index-url https://pypi.nvidia.com/ tensorrt-llm==1.1.0rc1
+# sudo rm /etc/pip/constraint.txt; sudo touch /etc/pip/constraint.txt

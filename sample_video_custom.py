@@ -4,10 +4,37 @@ from pathlib import Path
 from loguru import logger
 from datetime import datetime
 import nvtx
+import torch
 
 from hyvideo.utils.file_utils import save_videos_grid
 from hyvideo.config import parse_args
 from hyvideo.inference import HunyuanVideoSampler
+from hyvideo.modules.models import HYVideoDiffusionTransformer
+from hyvideo.modules.linear_impl import VflyLinear
+
+
+def replace_blockwise_gemm(transformer: HYVideoDiffusionTransformer):
+    # Only replace the linear layers in HYVideoDiffusionTransformer
+    model = transformer
+    replace_layers = []
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            tokens = name.strip().split('.')
+            layer = model
+            for t in tokens[:-1]:
+                if not t.isnumeric():
+                    layer = getattr(layer, t)
+                else:
+                    layer = layer[int(t)]
+            if tokens[0] not in ["single_blocks", "double_blocks"] or tokens[-1] == "linear":
+                continue
+            replace_layers.append([layer, tokens[-1], module])
+
+    for layer, name, module in replace_layers:
+        setattr(layer, name, VflyLinear.from_linear(module, linear_type="trtllm-fp8-blockwise"))
+        if 'LOCAL_RANK' not in os.environ or int(os.environ['LOCAL_RANK']) == 0:
+            logger.debug(f"Replace {name} with fp8 blockwise gemm")
+    return transformer
 
 
 def main():
@@ -27,6 +54,10 @@ def main():
 
     # Load models
     hunyuan_video_sampler = HunyuanVideoSampler.from_pretrained(models_root_path, args=args)
+    if args.blockwise_gemm is not None:
+        hunyuan_video_sampler.model = replace_blockwise_gemm(hunyuan_video_sampler.model)
+        for block in hunyuan_video_sampler.model.single_blocks + hunyuan_video_sampler.model.double_blocks:
+            block.blockwise_gemm = args.blockwise_gemm
     
     # Get the updated args
     args = hunyuan_video_sampler.args

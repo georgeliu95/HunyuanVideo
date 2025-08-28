@@ -346,6 +346,8 @@ class MMDoubleStreamBlockNoMod(nn.Module):
             **factory_kwargs,
         )
         self.hybrid_seq_parallel_attn = None
+        self.blockwise_gemm = None
+        self.attn_type = "flash"
 
     def enable_deterministic(self):
         self.deterministic = True
@@ -366,6 +368,7 @@ class MMDoubleStreamBlockNoMod(nn.Module):
         max_seqlen_kv: Optional[int] = None,
         freqs_cis: tuple = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        input_dtype = img.dtype
         img_qkv_rng = nvtx.start_range(message="img_qkv", color="green")
         # 图像分支处理 - 不使用modulation
         img_modulated = self.img_norm1(img)  # 直接normalization，不使用modulate
@@ -408,6 +411,11 @@ class MMDoubleStreamBlockNoMod(nn.Module):
         assert (
             host_seqlens_q.shape[0] == 2 * img.shape[0] + 1
         ), f"host_seqlens_q.shape:{host_seqlens_q.shape}, img.shape[0]:{img.shape[0]}"
+
+        if self.blockwise_gemm is not None:
+            q = q.to(input_dtype)
+            k = k.to(input_dtype)
+            v = v.to(input_dtype)
         
         attn_rng = nvtx.start_range(message="attn", color="green")
         # attention computation start
@@ -421,6 +429,7 @@ class MMDoubleStreamBlockNoMod(nn.Module):
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_kv=max_seqlen_kv,
                 batch_size=img_k.shape[0],
+                mode=self.attn_type,
             )
         else:
             attn = parallel_attention(
@@ -447,6 +456,9 @@ class MMDoubleStreamBlockNoMod(nn.Module):
         txt = txt + self.txt_attn_proj(txt_attn)  # 直接残差连接
         txt = txt + self.txt_mlp(self.txt_norm2(txt))  # 直接残差连接
         nvtx.end_range(proj_rng)
+        if self.blockwise_gemm is not None:
+            img = img.to(input_dtype)
+            txt = txt.to(input_dtype)
         return img, txt
 
 
@@ -514,6 +526,8 @@ class MMSingleStreamBlock(nn.Module):
             **factory_kwargs,
         )
         self.hybrid_seq_parallel_attn = None
+        self.blockwise_gemm = None
+        self.attn_type = "flash"
 
     def enable_deterministic(self):
         self.deterministic = True
@@ -534,6 +548,7 @@ class MMSingleStreamBlock(nn.Module):
         max_seqlen_kv: Optional[int] = None,
         freqs_cis: Tuple[torch.Tensor, torch.Tensor] = None,
     ) -> torch.Tensor:
+        input_dtype = x.dtype
         mod_rng = nvtx.start_range(message="mod", color="green")
         mod_shift, mod_scale, mod_gate = self.modulation(vec).chunk(3, dim=-1)
         x_mod = modulate(self.pre_norm(x), shift=mod_shift, scale=mod_scale)
@@ -568,6 +583,11 @@ class MMSingleStreamBlock(nn.Module):
             host_seqlens_q.shape[0] == 2 * x.shape[0] + 1
         ), f"host_seqlens_q.shape:{host_seqlens_q.shape}, x.shape[0]:{x.shape[0]}"
         
+        if self.blockwise_gemm is not None:
+            q = q.to(input_dtype)
+            k = k.to(input_dtype)
+            v = v.to(input_dtype)
+        
         # attention computation start
         if not self.hybrid_seq_parallel_attn:
             attn = attention(
@@ -579,6 +599,7 @@ class MMSingleStreamBlock(nn.Module):
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_kv=max_seqlen_kv,
                 batch_size=x.shape[0],
+                mode=self.attn_type,
             )
         else:
             attn = parallel_attention(
@@ -597,7 +618,10 @@ class MMSingleStreamBlock(nn.Module):
         # Compute activation in mlp stream, cat again and run second linear layer.
         output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
         nvtx.end_range(mlp_rng)
-        return x + apply_gate(output, gate=mod_gate)
+        output = x + apply_gate(output, gate=mod_gate)
+        if self.blockwise_gemm is not None:
+            output = output.to(input_dtype)
+        return output
 
 
 class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
