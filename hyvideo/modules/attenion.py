@@ -24,6 +24,10 @@ MEMORY_LAYOUT = {
         lambda x: x.view(x.shape[0] * x.shape[1], *x.shape[2:]),
         lambda x: x,
     ),
+    "flash_attn3": (
+        lambda x: x.view(x.shape[0] * x.shape[1], *x.shape[2:]),
+        lambda x: x,
+    ),
     "sage_auto": (
         lambda x: x.transpose(1, 2),
         lambda x: x.transpose(1, 2),
