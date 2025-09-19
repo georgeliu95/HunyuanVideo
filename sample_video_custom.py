@@ -13,7 +13,7 @@ from hyvideo.modules.models import HYVideoDiffusionTransformer
 from hyvideo.modules.linear_impl import VflyLinear
 
 
-def replace_blockwise_gemm(transformer: HYVideoDiffusionTransformer):
+def replace_blockwise_gemm(transformer: HYVideoDiffusionTransformer, blockwise_gemm: str = "fp8"):
     # Only replace the linear layers in HYVideoDiffusionTransformer
     model = transformer
     replace_layers = []
@@ -31,9 +31,9 @@ def replace_blockwise_gemm(transformer: HYVideoDiffusionTransformer):
             replace_layers.append([layer, tokens[-1], module])
 
     for layer, name, module in replace_layers:
-        setattr(layer, name, VflyLinear.from_linear(module, linear_type="trtllm-fp8-blockwise"))
+        setattr(layer, name, VflyLinear.from_linear(module, linear_type=f"trtllm-{blockwise_gemm}-blockwise"))
         if 'LOCAL_RANK' not in os.environ or int(os.environ['LOCAL_RANK']) == 0:
-            logger.debug(f"Replace {name} with fp8 blockwise gemm")
+            logger.debug(f"Replace {name} with {blockwise_gemm} blockwise gemm")
     return transformer
 
 
@@ -55,7 +55,7 @@ def main():
     # Load models
     hunyuan_video_sampler = HunyuanVideoSampler.from_pretrained(models_root_path, args=args)
     if args.blockwise_gemm is not None:
-        hunyuan_video_sampler.model = replace_blockwise_gemm(hunyuan_video_sampler.model)
+        hunyuan_video_sampler.model = replace_blockwise_gemm(hunyuan_video_sampler.model, args.blockwise_gemm)
         for block in hunyuan_video_sampler.model.single_blocks + hunyuan_video_sampler.model.double_blocks:
             block.blockwise_gemm = args.blockwise_gemm
     

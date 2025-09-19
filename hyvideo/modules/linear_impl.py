@@ -15,6 +15,70 @@ class DefaultLinear:
         return F.linear(input, weight, bias)
 
 
+class TrtllmNVFp4BlockLinear:
+    def __init__(self):
+        try:
+            import tensorrt_llm  # noqa
+        except ImportError:
+            raise ImportError("TensorRT-LLM is not installed.")
+        
+        self.scaling_vector_size = 16
+        self.alpha = 0.5
+        self.online_quantize = True
+        self.trtllm_tuned = False
+        
+    def __call__(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        weight_global_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        origin_dim = input.dim()
+        origin_shape = input.shape
+        origin_dtype = input.dtype
+        input = input.to(torch.bfloat16)
+
+        act_global_scale = 448.0 * 6.0 / input.abs().amax().float()
+        alpha = 1.0 / (weight_global_scale * act_global_scale)
+        if input.dim() == 3:
+            act_fp4, act_sf = torch.ops.trtllm.fp4_batched_quantize(input, act_global_scale, self.scaling_vector_size, False)
+            if not self.trtllm_tuned:
+                with torch.inference_mode(), autotune():
+                    output = torch.ops.trtllm.fp4_bmm(
+                        act_fp4,
+                        weight.unsqueeze(0),
+                        act_sf,
+                        weight_scale.unsqueeze(0),
+                        alpha,
+                        fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
+                        out_dtype=origin_dtype,
+                    )
+                self.trtllm_tuned = True
+            else:
+                output = torch.ops.trtllm.fp4_bmm(
+                    act_fp4,
+                    weight.unsqueeze(0),
+                    act_sf,
+                    weight_scale.unsqueeze(0),
+                    alpha,
+                    fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
+                    out_dtype=origin_dtype,
+                )
+        else:
+            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(input, act_global_scale, self.scaling_vector_size, False)
+            output = torch.ops.trtllm.nvfp4_gemm(
+                act_fp4, weight, act_sf, weight_scale, alpha, output_dtype=origin_dtype
+            )
+
+        if bias is not None:
+            output = output + bias
+
+        return output
+
+
 class TrtllmFp8BlockLinear:
     def __init__(self):
         try:
@@ -31,10 +95,12 @@ class TrtllmFp8BlockLinear:
         bias: torch.Tensor,
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
+        weight_global_scale: torch.Tensor = None,
     ) -> torch.Tensor:
 
         # input
         origin_shape = input.shape
+        origin_dim = input.dim()
         origin_dtype = input.dtype
         input = input.to(torch.bfloat16)
 
@@ -47,7 +113,7 @@ class TrtllmFp8BlockLinear:
 
         if bias is not None:
             output = output + bias
-        if output.dim() == 2:
+        if output.dim() == 2 and origin_dim == 3:
             output = output.reshape(origin_shape[0], origin_shape[1], -1)
         return output
 
@@ -68,7 +134,9 @@ class TrtllmFp8PerTensorLinear:
         bias: torch.Tensor,
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
+        weight_global_scale: torch.Tensor = None,
     ) -> torch.Tensor:
+        origin_dim = input.dim()
         origin_shape = input.shape
         origin_dtype = input.dtype
         input = input.to(torch.bfloat16)
@@ -80,18 +148,30 @@ class TrtllmFp8PerTensorLinear:
         if qinput.dim() == 3:
             qinput = qinput.reshape(-1, qinput.shape[-1])
 
-        output = torch.ops.trtllm.cublas_scaled_mm(
-            qinput,
-            weight,
-            scale_a=cur_input_scale,
-            scale_b=weight_scale,
-            bias=None,
-            out_dtype=input.dtype,
-        )
+        # This op does not support bias now.
+        if qinput.shape[0] <= 8:
+            # use cuda core for small m dimension
+            output = torch.ops.trtllm.cuda_scaled_mm(
+                qinput,
+                weight,
+                scale_a=cur_input_scale,
+                scale_b=weight_scale,
+                bias=None,
+                out_dtype=input.dtype,
+            )
+        else:
+            output = torch.ops.trtllm.cublas_scaled_mm(
+                qinput,
+                weight,
+                scale_a=cur_input_scale,
+                scale_b=weight_scale,
+                bias=None,
+                out_dtype=input.dtype,
+            )
         output = output.to(origin_dtype)
         if bias is not None:
             output = output + bias
-        if output.dim() == 2:
+        if output.dim() == 2 and origin_dim == 3:
             output = output.reshape(origin_shape[0], origin_shape[1], -1)
         return output
 
@@ -103,9 +183,27 @@ class VflyLinear(torch.nn.Linear):
         self.linear_impl = None
         self.input_scale = None
         self.weight_scale = None
+        self.weight_global_scale = None
         self.linear_type = linear_type
 
-    def create_blockwise_quantized_weight(
+    def create_nvfp4_blockwise_quantized_weight(
+        self,
+        param_value: torch.Tensor,
+        block_size: int = 128,
+    ):
+        try:
+            import tensorrt_llm  # noqa
+        except ImportError:
+            raise ImportError("TensorRT-LLM is not installed.")
+        import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+        vec_size = 16
+
+        global_max_abs = torch.amax(torch.abs(param_value))
+        weight_global_scale = 448.0 * 6.0 / global_max_abs.float()
+        weight_fp4, weight_scale = torch.ops.trtllm.fp4_quantize(param_value, weight_global_scale, vec_size, False)
+        return weight_fp4.to(fp4_utils.float4_e2m1x2), weight_scale.to(fp4_utils.float4_sf_dtype), weight_global_scale
+
+    def create_fp8_blockwise_quantized_weight(
         self,
         param_value: torch.Tensor,
         block_size: int = 128,
@@ -153,7 +251,7 @@ class VflyLinear(torch.nn.Linear):
         quantized_param, scale = _quantize(param_value, scale, fp8_min, fp8_max)
         return quantized_param, scale
 
-    def create_per_tensor_quantized_weight(self, param_value: torch.Tensor):
+    def create_fp8_per_tensor_quantized_weight(self, param_value: torch.Tensor):
         param_value = param_value.to(torch.float32)
 
         # Get FP8 min/max values
@@ -179,22 +277,33 @@ class VflyLinear(torch.nn.Linear):
             self.linear_impl = TrtllmFp8BlockLinear()
         elif self.linear_type == "trtllm-fp8-per-tensor":
             self.linear_impl = TrtllmFp8PerTensorLinear()
+        elif self.linear_type == "trtllm-nvfp4-blockwise":
+            self.linear_impl = TrtllmNVFp4BlockLinear()
         else:
             self.linear_impl = DefaultLinear()
 
         weight_name = self.linear_type + "_weight"
         weight_scale_name = self.linear_type + "_weight_scale"
+        weight_global_scale_name = self.linear_type + "_weight_global_scale"
         # compute quantized weight and weight scale if needed
         if self.linear_type == "trtllm-fp8-blockwise":
             if not hasattr(self, weight_name) or not hasattr(self, weight_scale_name):
-                weight, weight_scale = self.create_blockwise_quantized_weight(self.weight)
+                weight, weight_scale = self.create_fp8_blockwise_quantized_weight(self.weight)
                 self.register_parameter(weight_name, torch.nn.Parameter(weight))
                 self.register_buffer(weight_scale_name, weight_scale)
         elif self.linear_type == "trtllm-fp8-per-tensor":
             if not hasattr(self, weight_name) or not hasattr(self, weight_scale_name):
-                weight, weight_scale = self.create_per_tensor_quantized_weight(self.weight)
+                weight, weight_scale = self.create_fp8_per_tensor_quantized_weight(self.weight)
                 self.register_parameter(weight_name, torch.nn.Parameter(weight))
                 self.register_buffer(weight_scale_name, weight_scale)
+        elif self.linear_type == "trtllm-nvfp4-blockwise":
+            self.scaling_vector_size = self.linear_impl.scaling_vector_size
+            assert self.in_features % self.scaling_vector_size == 0, f"in_features {self.in_features} must be divisible by scaling_vector_size {self.scaling_vector_size}"
+            if not hasattr(self, weight_name) or not hasattr(self, weight_scale_name):
+                weight, weight_scale, weight_global_scale = self.create_nvfp4_blockwise_quantized_weight(self.weight)
+                self.register_parameter(weight_name, torch.nn.Parameter(weight, requires_grad=False))
+                self.register_buffer(weight_scale_name, weight_scale)
+                self.register_buffer(weight_global_scale_name, weight_global_scale)
 
         if self.linear_type != "auto":
             # Free default weight to save memory
@@ -206,6 +315,8 @@ class VflyLinear(torch.nn.Linear):
                     keys_to_delete.append(key)
             for key, _ in self.named_buffers():
                 if key.endswith("_weight_scale") and key != weight_scale_name:
+                    keys_to_delete.append(key)
+                elif key.endswith("_weight_global_scale") and key != weight_global_scale_name:
                     keys_to_delete.append(key)
             for key in keys_to_delete:
                 delattr(self, key)
@@ -219,15 +330,21 @@ class VflyLinear(torch.nn.Linear):
         if self.linear_type == "default":
             weight = self.weight
             weight_scale = None
+            weight_global_scale = None
+        elif self.linear_type == "trtllm-nvfp4-blockwise":
+            weight = getattr(self, weight_name)
+            weight_scale = getattr(self, weight_scale_name)
+            weight_global_scale = getattr(self, weight_global_scale_name)
         else:
             weight = getattr(self, weight_name)
             weight_scale = getattr(self, weight_scale_name)
+            weight_global_scale = None
 
-        return weight, weight_scale
+        return weight, weight_scale, weight_global_scale
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        weight, weight_scale = self.select_linear_impl()
-        return self.linear_impl(input, weight, self.bias, self.input_scale, weight_scale)
+        weight, weight_scale, weight_global_scale = self.select_linear_impl()
+        return self.linear_impl(input, weight, self.bias, self.input_scale, weight_scale, weight_global_scale)
 
     @classmethod
     def from_linear(cls, linear: torch.nn.Linear, linear_type: str = "default") -> "VflyLinear":

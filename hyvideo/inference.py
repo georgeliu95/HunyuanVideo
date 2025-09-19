@@ -705,8 +705,8 @@ class HunyuanVideoSampler(Inference):
                       n_tokens: {n_tokens}
                     flow_shift: {flow_shift}
        embedded_guidance_scale: {embedded_guidance_scale}
-                     attn_type: {self.pipeline.transformer.single_blocks[0].attn_type}
-                blockwise_gemm: {self.pipeline.transformer.single_blocks[0].blockwise_gemm}"""
+                     attn_type: {self.pipeline.transformer.double_blocks[0].attn_type}
+                blockwise_gemm: {self.pipeline.transformer.double_blocks[0].blockwise_gemm}"""
        
         logger.debug(debug_str)
 

@@ -3,13 +3,13 @@
 # GPU_TYPE="h100"
 GPU_TYPE="smc6kd"
 # NSYS_CAPTURE_RANGE="pipeline"
-NSYS_CAPTURE_RANGE="watchout"
+NSYS_CAPTURE_RANGE="monitor_window"
 
 # MODEL_BASE="/scratch/HunyuanVideo/ckpts"
 MODEL_BASE=""
 
 # 创建nsys输出目录
-NSYS_OUTPUT_DIR="nsys/smc521.opt"
+NSYS_OUTPUT_DIR="nsys/smc521.6kd.fp8_sage_gemm"
 mkdir -p $NSYS_OUTPUT_DIR
 
 # 定义配置数组
