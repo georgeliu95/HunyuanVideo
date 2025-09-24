@@ -48,6 +48,15 @@ def add_network_args(parser: argparse.ArgumentParser):
     group.add_argument(
         "--rope-theta", type=int, default=256, help="Theta used in RoPE."
     )
+
+    # Quantization for Linear Layer
+    group.add_argument(
+        "--quant-gemm-type",
+        type=str,
+        default=None,
+        choices=["svdquant.int4", "nvfp4", "blockwise.fp8"],
+        help="Quantization type for the transformer.",
+    )
     return parser
 
 
