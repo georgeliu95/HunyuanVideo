@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import nvtx
+
 
 ########################################################
 # FAKE SVDQuant INT4 Linear
@@ -131,6 +133,7 @@ def set_int4_layer(model):
 ########################################################
 
 class DefaultLinear:
+    @nvtx.annotate(message="DefaultLinear.__call__", color="yellow")
     def __call__(
         self,
         input: torch.Tensor,
@@ -154,6 +157,7 @@ class TrtllmNVFp4BlockLinear:
         self.online_quantize = True
         self.trtllm_tuned = False
 
+    @nvtx.annotate(message="TrtllmNVFp4BlockLinear.__call__", color="yellow")
     # nvFP4 GEMM only accepts bfloat16 inputs
     @torch.cuda.amp.custom_fwd(cast_inputs=torch.bfloat16)
     def __call__(
@@ -206,6 +210,76 @@ class TrtllmNVFp4BlockLinear:
         return output
 
 
+class TrtllmFp4SvdquantLinear:
+    def __init__(self):
+        try:
+            import tensorrt_llm  # noqa
+        except ImportError:
+            raise ImportError("TensorRT-LLM is not installed.")
+
+        self.scaling_vector_size = 16
+        self.alpha = 0.5
+        self.online_quantize = True
+        self.trtllm_tuned = False
+        self.low_rank_weights = None
+    
+    @nvtx.annotate(message="TrtllmFp4SvdquantLinear.__call__", color="yellow")
+    # nvFP4 GEMM only accepts bfloat16 inputs
+    @torch.cuda.amp.custom_fwd(cast_inputs=torch.bfloat16)
+    def __call__(
+        self,
+        input: torch.Tensor,
+        weight: torch.Tensor,
+        bias: torch.Tensor,
+        input_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        weight_global_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+
+        # Low-rank branch GEMM
+        assert self.low_rank_weights is not None, "low_rank_weights is not initialized"
+        lr_out = torch.nn.functional.linear(input, self.low_rank_weights, bias)
+
+        # nvFP4 GEMM
+        origin_dtype = input.dtype
+        act_global_scale = 448.0 * 6.0 / input.abs().amax().float()
+        alpha = 1.0 / (weight_global_scale * act_global_scale)
+        if input.dim() == 3:
+            act_fp4, act_sf = torch.ops.trtllm.fp4_batched_quantize(input, act_global_scale, self.scaling_vector_size, False)
+            if not self.trtllm_tuned:
+                with torch.inference_mode():
+                    residual_out = torch.ops.trtllm.fp4_bmm(
+                        act_fp4,
+                        weight.unsqueeze(0),
+                        act_sf,
+                        weight_scale.unsqueeze(0),
+                        alpha,
+                        fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
+                        out_dtype=origin_dtype,
+                    )
+                self.trtllm_tuned = True
+            else:
+                residual_out = torch.ops.trtllm.fp4_bmm(
+                    act_fp4,
+                    weight.unsqueeze(0),
+                    act_sf,
+                    weight_scale.unsqueeze(0),
+                    alpha,
+                    fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4,
+                    out_dtype=origin_dtype,
+                )
+        else:
+            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(input, act_global_scale, self.scaling_vector_size, False)
+            residual_out = torch.ops.trtllm.nvfp4_gemm(
+                act_fp4, weight, act_sf, weight_scale, alpha, output_dtype=origin_dtype
+            )
+
+        output = lr_out + residual_out
+
+        return output
+
+
 class TrtllmFp8BlockLinear:
     def __init__(self):
         try:
@@ -215,6 +289,7 @@ class TrtllmFp8BlockLinear:
         except ImportError:
             raise ImportError("TensorRT-LLM is not installed.")
 
+    @nvtx.annotate(message="TrtllmFp8BlockLinear.__call__", color="yellow")
     def __call__(
         self,
         input: torch.Tensor,
@@ -254,6 +329,7 @@ class TrtllmFp8PerTensorLinear:
         except ImportError:
             raise ImportError("TensorRT-LLM is not installed.")
 
+    @nvtx.annotate(message="TrtllmFp8PerTensorLinear.__call__", color="yellow")
     def __call__(
         self,
         input: torch.Tensor,
@@ -312,7 +388,9 @@ class VflyLinear(torch.nn.Linear):
         self.weight_scale = None
         self.weight_global_scale = None
         self.linear_type = linear_type
+        self.low_rank_weights = None
 
+    @nvtx.annotate(message="VflyLinear.create_nvfp4_blockwise_quantized_weight", color="green")
     def create_nvfp4_blockwise_quantized_weight(
         self,
         param_value: torch.Tensor,
@@ -330,6 +408,21 @@ class VflyLinear(torch.nn.Linear):
         weight_fp4, weight_scale = torch.ops.trtllm.fp4_quantize(param_value, weight_global_scale, vec_size, False)
         return weight_fp4.to(fp4_utils.float4_e2m1x2), weight_scale.to(fp4_utils.float4_sf_dtype), weight_global_scale
 
+    @nvtx.annotate(message="VflyLinear.create_nvfp4_svdquant_quantized_weight", color="green")
+    def create_nvfp4_svdquant_quantized_weight(
+            self, 
+            param_value: torch.Tensor,
+            rank: int = 64):
+        u, s, vh = torch.linalg.svd(param_value.float())
+        us = u[:, : rank] * s[: rank]
+        vh = vh[: rank]
+        lora = torch.mm(us, vh)
+        residual_fp32 = param_value.float() - lora
+        residual_bf16 = residual_fp32.to(torch.bfloat16)
+        residual_fp4, residual_scale, residual_global_scale = self.create_nvfp4_blockwise_quantized_weight(residual_bf16)
+        return us, vh, residual_fp4, residual_scale, residual_global_scale
+
+    @nvtx.annotate(message="VflyLinear.create_fp8_blockwise_quantized_weight", color="green")
     def create_fp8_blockwise_quantized_weight(
         self,
         param_value: torch.Tensor,
@@ -378,6 +471,7 @@ class VflyLinear(torch.nn.Linear):
         quantized_param, scale = _quantize(param_value, scale, fp8_min, fp8_max)
         return quantized_param, scale
 
+    @nvtx.annotate(message="VflyLinear.create_fp8_per_tensor_quantized_weight", color="green")
     def create_fp8_per_tensor_quantized_weight(self, param_value: torch.Tensor):
         param_value = param_value.to(torch.float32)
 
@@ -398,6 +492,7 @@ class VflyLinear(torch.nn.Linear):
         quantized_param, scale = _quantize(param_value, scale, fp8_min, fp8_max)
         return quantized_param, scale
 
+    @nvtx.annotate(message="VflyLinear.select_linear_impl", color="green")
     def select_linear_impl(self):
         # select linear implementation
         if self.linear_type == "trtllm-fp8-blockwise":
@@ -406,6 +501,8 @@ class VflyLinear(torch.nn.Linear):
             self.linear_impl = TrtllmFp8PerTensorLinear()
         elif self.linear_type == "trtllm-nvfp4-blockwise":
             self.linear_impl = TrtllmNVFp4BlockLinear()
+        elif self.linear_type == "trtllm-nvfp4-svdquant":
+            self.linear_impl = TrtllmFp4SvdquantLinear()
         else:
             self.linear_impl = DefaultLinear()
 
@@ -431,6 +528,16 @@ class VflyLinear(torch.nn.Linear):
                 self.register_parameter(weight_name, torch.nn.Parameter(weight, requires_grad=False))
                 self.register_buffer(weight_scale_name, weight_scale)
                 self.register_buffer(weight_global_scale_name, weight_global_scale)
+        elif self.linear_type == "trtllm-nvfp4-svdquant":
+            self.scaling_vector_size = self.linear_impl.scaling_vector_size
+            assert self.in_features % self.scaling_vector_size == 0, f"in_features {self.in_features} must be divisible by scaling_vector_size {self.scaling_vector_size}"
+            if not hasattr(self, weight_name) or not hasattr(self, weight_scale_name):
+                us, vh, residual_fp4, residual_scale, residual_global_scale = self.create_nvfp4_svdquant_quantized_weight(self.weight)
+                self.low_rank_weights = torch.mm(us, vh)
+                self.register_parameter(weight_name + "_low_rank_weights", torch.nn.Parameter(self.low_rank_weights, requires_grad=False))
+                self.register_parameter(weight_name, torch.nn.Parameter(residual_fp4, requires_grad=False))
+                self.register_buffer(weight_scale_name, residual_scale)
+                self.register_buffer(weight_global_scale_name, residual_global_scale)
 
         if self.linear_type != "auto":
             # Free default weight to save memory
@@ -462,6 +569,12 @@ class VflyLinear(torch.nn.Linear):
             weight = getattr(self, weight_name)
             weight_scale = getattr(self, weight_scale_name)
             weight_global_scale = getattr(self, weight_global_scale_name)
+        elif self.linear_type == "trtllm-nvfp4-svdquant":
+            weight = getattr(self, weight_name)
+            weight_scale = getattr(self, weight_scale_name)
+            weight_global_scale = getattr(self, weight_global_scale_name)
+            self.low_rank_weights = getattr(self, weight_name + "_low_rank_weights")
+            self.linear_impl.low_rank_weights = self.low_rank_weights
         else:
             weight = getattr(self, weight_name)
             weight_scale = getattr(self, weight_scale_name)
@@ -469,6 +582,7 @@ class VflyLinear(torch.nn.Linear):
 
         return weight, weight_scale, weight_global_scale
 
+    @nvtx.annotate(message="VflyLinear.forward", color="red")
     def forward(self, input: torch.Tensor) -> torch.Tensor:
         weight, weight_scale, weight_global_scale = self.select_linear_impl()
         return self.linear_impl(input, weight, self.bias, self.input_scale, weight_scale, weight_global_scale)
@@ -489,11 +603,15 @@ class VflyLinear(torch.nn.Linear):
         return vfly_linear
 
 
+@nvtx.annotate(message="replace_linear_layer", color="red")
 def replace_linear_layer(model, quant_gemm_type="svdquant.int4"):
     if quant_gemm_type == "svdquant.int4":
         quant_linear_fn = INT4Linear_svdquant
     elif quant_gemm_type == "nvfp4":
         nvfp4_linear_fn = partial(VflyLinear.from_linear, linear_type="trtllm-nvfp4-blockwise")
+        quant_linear_fn = nvfp4_linear_fn
+    elif quant_gemm_type == "svdquant.nvfp4":
+        nvfp4_linear_fn = partial(VflyLinear.from_linear, linear_type="trtllm-nvfp4-svdquant")
         quant_linear_fn = nvfp4_linear_fn
     else:
         raise ValueError(f"Invalid quant_gemm_type: {quant_gemm_type}")
