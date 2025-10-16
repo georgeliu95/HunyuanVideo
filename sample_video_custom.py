@@ -28,29 +28,47 @@ def main():
     # Load models
     hunyuan_video_sampler = HunyuanVideoSampler.from_pretrained(models_root_path, args=args)
     if args.quant_gemm_type is not None:
+        logger.info(f"Replace linear layer with {args.quant_gemm_type} gemm type")
         hunyuan_video_sampler.pipeline.transformer = replace_linear_layer(hunyuan_video_sampler.pipeline.transformer, args.quant_gemm_type)
     
     # Get the updated args
     args = hunyuan_video_sampler.args
 
+    if args.warmup:
+        logger.info("Warmup the model...(3 steps)")
+        hunyuan_video_sampler.predict(
+            prompt=args.prompt, 
+            height=args.video_size[0],
+            width=args.video_size[1],
+            video_length=args.video_length,
+            seed=args.seed,
+            negative_prompt=args.neg_prompt,
+            infer_steps=3,
+            guidance_scale=args.cfg_scale,
+            num_videos_per_prompt=args.num_videos,
+            flow_shift=args.flow_shift,
+            batch_size=args.batch_size,
+            embedded_guidance_scale=args.embedded_cfg_scale
+        )
+
     # Start sampling
     # TODO: batch inference check
-    pipeline_rng = nvtx.start_range(message="pipeline", color="blue")
-    outputs = hunyuan_video_sampler.predict(
-        prompt=args.prompt, 
-        height=args.video_size[0],
-        width=args.video_size[1],
-        video_length=args.video_length,
-        seed=args.seed,
-        negative_prompt=args.neg_prompt,
-        infer_steps=args.infer_steps,
-        guidance_scale=args.cfg_scale,
-        num_videos_per_prompt=args.num_videos,
-        flow_shift=args.flow_shift,
-        batch_size=args.batch_size,
-        embedded_guidance_scale=args.embedded_cfg_scale
-    )
-    nvtx.end_range(pipeline_rng)
+    logger.info(f"Start sampling...(infer_steps: {args.infer_steps})")
+    with nvtx.annotate(message="pipeline", color="blue"):
+        outputs = hunyuan_video_sampler.predict(
+            prompt=args.prompt, 
+            height=args.video_size[0],
+            width=args.video_size[1],
+            video_length=args.video_length,
+            seed=args.seed,
+            negative_prompt=args.neg_prompt,
+            infer_steps=args.infer_steps,
+            guidance_scale=args.cfg_scale,
+            num_videos_per_prompt=args.num_videos,
+            flow_shift=args.flow_shift,
+            batch_size=args.batch_size,
+            embedded_guidance_scale=args.embedded_cfg_scale
+        )
     samples = outputs['samples']
     
     # Save samples

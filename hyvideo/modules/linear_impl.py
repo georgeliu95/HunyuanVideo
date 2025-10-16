@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import nvtx
+from loguru import logger
 
 
 ########################################################
@@ -605,6 +606,7 @@ class VflyLinear(torch.nn.Linear):
 
 @nvtx.annotate(message="replace_linear_layer", color="red")
 def replace_linear_layer(model, quant_gemm_type="svdquant.int4"):
+    total_replaced_linear = 0
     if quant_gemm_type == "svdquant.int4":
         quant_linear_fn = INT4Linear_svdquant
     elif quant_gemm_type == "nvfp4":
@@ -621,6 +623,7 @@ def replace_linear_layer(model, quant_gemm_type="svdquant.int4"):
             if name == "linear1" or name == "linear2":
                 wrapped_module = quant_linear_fn(module)
                 setattr(block, name, wrapped_module)
+                total_replaced_linear += 1
     for block in model.double_blocks:
         for name, module in block.named_children():
             if name == "img_mlp":
@@ -628,10 +631,14 @@ def replace_linear_layer(model, quant_gemm_type="svdquant.int4"):
                     if subname == "fc1" or subname == "fc2":
                         wrapped_submodule = quant_linear_fn(submodule)
                         setattr(module, subname, wrapped_submodule)
+                        total_replaced_linear += 1
             elif name == "img_attn_qkv":
                 wrapped_module = quant_linear_fn(module)
                 setattr(block, name, wrapped_module)
+                total_replaced_linear += 1
             elif name == "img_attn_proj":
                 wrapped_module = quant_linear_fn(module)
                 setattr(block, name, wrapped_module)
+                total_replaced_linear += 1
+    logger.info(f"Have replaced {total_replaced_linear} layers")
     return model

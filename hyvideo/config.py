@@ -49,7 +49,19 @@ def add_network_args(parser: argparse.ArgumentParser):
         "--rope-theta", type=int, default=256, help="Theta used in RoPE."
     )
 
-    # Quantization for Linear Layer
+    # Attention
+    group.add_argument(
+        "--attn-type",
+        type=str,
+        default="fa",
+        choices=["fa3", "fa", "torch", "sage_auto"],
+        help="Attention type.",
+    )
+    group.add_argument(
+        "--optimize-memcpy",
+        action="store_true",
+        help="Optimize the memcpy for the transformer.",
+    )
     group.add_argument(
         "--quant-gemm-type",
         type=str,
@@ -263,6 +275,11 @@ def add_inference_args(parser: argparse.ArgumentParser):
         action="store_true",
         help="Use CPU offload for the model load.",
     )
+    group.add_argument(
+        "--skip-load-model",
+        action="store_true",
+        help="Skip loading the model states.",
+    )
 
     # ======================== Inference general setting ========================
     group.add_argument(
@@ -321,6 +338,11 @@ def add_inference_args(parser: argparse.ArgumentParser):
         type=int,
         default=129,
         help="How many frames to sample from a video. if using 3d vae, the number should be 4n+1",
+    )
+    group.add_argument(
+        "--warmup",
+        action="store_true",
+        help="Warmup the model before sampling.",
     )
     # --- prompt ---
     group.add_argument(

@@ -13,12 +13,24 @@ except ImportError:
     flash_attn = None
     flash_attn_varlen_func = None
     _flash_attn_forward = None
+try:
+    from flash_attn_interface import flash_attn_varlen_func as flash_attn3_varlen_func
+except ImportError:
+    flash_attn3_varlen_func = None
 
 
 MEMORY_LAYOUT = {
     "flash": (
         lambda x: x.view(x.shape[0] * x.shape[1], *x.shape[2:]),
         lambda x: x,
+    ),
+    "flash_attn3": (
+        lambda x: x.view(x.shape[0] * x.shape[1], *x.shape[2:]),
+        lambda x: x,
+    ),
+    "sage_auto": (
+        lambda x: x.transpose(1, 2),
+        lambda x: x.transpose(1, 2),
     ),
     "torch": (
         lambda x: x.transpose(1, 2),
@@ -45,8 +57,7 @@ def get_cu_seqlens(text_mask, img_len):
     text_len = text_mask.sum(dim=1)
     max_len = text_mask.shape[1] + img_len
 
-    cu_seqlens = torch.zeros([2 * batch_size + 1], dtype=torch.int32, device="cuda")
-
+    cu_seqlens = torch.zeros([2 * batch_size + 1], dtype=torch.int32, device=text_len.device)
     for i in range(batch_size):
         s = text_len[i] + img_len
         s1 = i * max_len + s
@@ -123,6 +134,40 @@ def attention(
                 is_causal=False
             )
             x = torch.cat([attn1, attn2], dim=2)
+    elif mode == "sage_auto":
+        from sageattention import sageattn
+        if attn_mask is not None and attn_mask.dtype != torch.bool:
+            attn_mask = attn_mask.to(q.dtype)
+        if cu_seqlens_q is None:
+            x = sageattn(
+                q, k, v, attn_mask=attn_mask, dropout_p=drop_rate, is_causal=causal
+            )
+        else:
+            attn1 = sageattn(
+                q[:, :, :cu_seqlens_q[1]],
+                k[:, :, :cu_seqlens_kv[1]],
+                v[:, :, :cu_seqlens_kv[1]],
+            )
+            attn2 = sageattn(
+                q[:, :, cu_seqlens_q[1]:],
+                k[:, :, cu_seqlens_kv[1]:],
+                v[:, :, cu_seqlens_kv[1]:],
+            )
+            x = torch.cat([attn1, attn2], dim=2)
+    elif mode == "flash_attn3":
+        x = flash_attn3_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            max_seqlen_q,
+            max_seqlen_kv,
+        )
+        # x with shape [(bxs), a, d]
+        x = x.view(
+            batch_size, max_seqlen_q, x.shape[-2], x.shape[-1]
+        )  # reshape x to [b, s, a, d]
     elif mode == "flash":
         x = flash_attn_varlen_func(
             q,

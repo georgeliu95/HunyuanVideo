@@ -23,6 +23,9 @@ import torch.distributed as dist
 import numpy as np
 from dataclasses import dataclass
 from packaging import version
+import nvtx
+import os
+
 
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.configuration_utils import FrozenDict
@@ -42,6 +45,8 @@ from diffusers.utils import (
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.utils import BaseOutput
+
+from xfuser.core.distributed import get_sequence_parallel_world_size
 
 from ...constants import PRECISION_TO_TYPE
 from ...vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
@@ -835,7 +840,7 @@ class HunyuanVideoPipeline(DiffusionPipeline):
         else:
             batch_size = prompt_embeds.shape[0]
 
-        device = torch.device(f"cuda:{dist.get_rank()}") if dist.is_initialized() else self._execution_device
+        device = torch.device(f"cuda:{os.environ.get('LOCAL_RANK', 0)}") if dist.is_initialized() else self._execution_device
 
         # 3. Encode input prompt
         lora_scale = (
@@ -844,51 +849,54 @@ class HunyuanVideoPipeline(DiffusionPipeline):
             else None
         )
 
-        (
-            prompt_embeds,
-            negative_prompt_embeds,
-            prompt_mask,
-            negative_prompt_mask,
-        ) = self.encode_prompt(
-            prompt,
-            device,
-            num_videos_per_prompt,
-            self.do_classifier_free_guidance,
-            negative_prompt,
-            prompt_embeds=prompt_embeds,
-            attention_mask=attention_mask,
-            negative_prompt_embeds=negative_prompt_embeds,
-            negative_attention_mask=negative_attention_mask,
-            lora_scale=lora_scale,
-            clip_skip=self.clip_skip,
-            data_type=data_type,
-        )
-        if self.text_encoder_2 is not None:
+        with nvtx.annotate(message="encode_prompt", color="red"):
             (
-                prompt_embeds_2,
-                negative_prompt_embeds_2,
-                prompt_mask_2,
-                negative_prompt_mask_2,
+                prompt_embeds,
+                negative_prompt_embeds,
+                prompt_mask,
+                negative_prompt_mask,
             ) = self.encode_prompt(
                 prompt,
                 device,
                 num_videos_per_prompt,
                 self.do_classifier_free_guidance,
                 negative_prompt,
-                prompt_embeds=None,
-                attention_mask=None,
-                negative_prompt_embeds=None,
-                negative_attention_mask=None,
+                prompt_embeds=prompt_embeds,
+                attention_mask=attention_mask,
+                negative_prompt_embeds=negative_prompt_embeds,
+                negative_attention_mask=negative_attention_mask,
                 lora_scale=lora_scale,
                 clip_skip=self.clip_skip,
-                text_encoder=self.text_encoder_2,
                 data_type=data_type,
             )
-        else:
-            prompt_embeds_2 = None
-            negative_prompt_embeds_2 = None
-            prompt_mask_2 = None
-            negative_prompt_mask_2 = None
+
+        with nvtx.annotate(message="encode_prompt_2", color="red"):
+            if self.text_encoder_2 is not None:
+                (
+                    prompt_embeds_2,
+                    negative_prompt_embeds_2,
+                    prompt_mask_2,
+                    negative_prompt_mask_2,
+                ) = self.encode_prompt(
+                    prompt,
+                    device,
+                    num_videos_per_prompt,
+                    self.do_classifier_free_guidance,
+                    negative_prompt,
+                    prompt_embeds=None,
+                    attention_mask=None,
+                    negative_prompt_embeds=None,
+                    negative_attention_mask=None,
+                    lora_scale=lora_scale,
+                    clip_skip=self.clip_skip,
+                    text_encoder=self.text_encoder_2,
+                    data_type=data_type,
+                )
+            else:
+                prompt_embeds_2 = None
+                negative_prompt_embeds_2 = None
+                prompt_mask_2 = None
+                negative_prompt_mask_2 = None
 
         # For classifier free guidance, we need to do two forward passes.
         # Here we concatenate the unconditional and text embeddings into a single batch
@@ -904,64 +912,92 @@ class HunyuanVideoPipeline(DiffusionPipeline):
 
 
         # 4. Prepare timesteps
-        extra_set_timesteps_kwargs = self.prepare_extra_func_kwargs(
-            self.scheduler.set_timesteps, {"n_tokens": n_tokens}
-        )
-        timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler,
-            num_inference_steps,
-            device,
-            timesteps,
-            sigmas,
-            **extra_set_timesteps_kwargs,
-        )
+        with nvtx.annotate(message="prepare_timesteps", color="red"):
+            extra_set_timesteps_kwargs = self.prepare_extra_func_kwargs(
+                self.scheduler.set_timesteps, {"n_tokens": n_tokens}
+            )
+            timesteps, num_inference_steps = retrieve_timesteps(
+                self.scheduler,
+                num_inference_steps,
+                device,
+                timesteps,
+                sigmas,
+                **extra_set_timesteps_kwargs,
+            )
 
-        if "884" in vae_ver:
-            video_length = (video_length - 1) // 4 + 1
-        elif "888" in vae_ver:
-            video_length = (video_length - 1) // 8 + 1
-        else:
-            video_length = video_length
+        with nvtx.annotate(message="prepare_latents", color="red"):
+            if "884" in vae_ver:
+                video_length = (video_length - 1) // 4 + 1
+            elif "888" in vae_ver:
+                video_length = (video_length - 1) // 8 + 1
+            else:
+                video_length = video_length
 
-        # 5. Prepare latent variables
-        num_channels_latents = self.transformer.config.in_channels
-        latents = self.prepare_latents(
-            batch_size * num_videos_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            video_length,
-            prompt_embeds.dtype,
-            device,
-            generator,
-            latents,
-        )
+            # 5. Prepare latent variables
+            num_channels_latents = self.transformer.config.in_channels
+            latents = self.prepare_latents(
+                batch_size * num_videos_per_prompt,
+                num_channels_latents,
+                height,
+                width,
+                video_length,
+                prompt_embeds.dtype,
+                device,
+                generator,
+                latents,
+            )
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
-        extra_step_kwargs = self.prepare_extra_func_kwargs(
-            self.scheduler.step,
-            {"generator": generator, "eta": eta},
-        )
+        with nvtx.annotate(message="prepare_extra_step_kwargs", color="red"):
+            extra_step_kwargs = self.prepare_extra_func_kwargs(
+                self.scheduler.step,
+                {"generator": generator, "eta": eta},
+            )
 
-        target_dtype = PRECISION_TO_TYPE[self.args.precision]
-        autocast_enabled = (
-            target_dtype != torch.float32
-        ) and not self.args.disable_autocast
-        vae_dtype = PRECISION_TO_TYPE[self.args.vae_precision]
-        vae_autocast_enabled = (
-            vae_dtype != torch.float32
-        ) and not self.args.disable_autocast
+        with nvtx.annotate(message="prepare_target_dtype", color="red"):
+            target_dtype = PRECISION_TO_TYPE[self.args.precision]
+            autocast_enabled = (
+                target_dtype != torch.float32
+            ) and not self.args.disable_autocast
+            vae_dtype = PRECISION_TO_TYPE[self.args.vae_precision]
+            vae_autocast_enabled = (
+                vae_dtype != torch.float32
+            ) and not self.args.disable_autocast
 
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
+        ref_cu_seqlens_q = None
+        host_seqlens_q = None
+        if kwargs.get("optimize_memcpy", False):
+            # [Optional] Prepare cu_seqlens_q
+            if n_tokens is not None:
+                from hyvideo.modules.attenion import get_cu_seqlens
+                with nvtx.annotate(message="get_cu_seqlens", color="red"):
+                # Compute cu_squlens and max_seqlen for flash attention
+                    if dist.is_initialized():
+                        ref_cu_seqlens_q = get_cu_seqlens(text_mask=prompt_mask, img_len=n_tokens // get_sequence_parallel_world_size())
+                    else:
+                        ref_cu_seqlens_q = get_cu_seqlens(text_mask=prompt_mask, img_len=n_tokens)
+                    host_seqlens_q = ref_cu_seqlens_q.cpu()
+            # [Optional] Copy freqs_cis to the device of the transformer
+            if isinstance(freqs_cis, tuple):
+                freqs_cis = (freqs_cis[0].to(device), freqs_cis[1].to(device))
+            elif isinstance(freqs_cis, torch.Tensor):
+                freqs_cis = freqs_cis.to(device)
+
         # if is_progress_bar:
+        monitor_window_rng = None
+        monitor_window_step_range = [3, 6] # NOTE: Only monitor the first 3-6 steps for efficiency
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
 
+                if monitor_window_rng is None and i == monitor_window_step_range[0]:
+                    monitor_window_rng = nvtx.start_range(message="monitor_window", color="blue")
+                denoising_loop_rng = nvtx.start_range(message=f"denoising_loop_{i}", color="red")
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = (
                     torch.cat([latents] * 2)
@@ -997,6 +1033,8 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         freqs_cos=freqs_cis[0],  # [seqlen, head_dim]
                         freqs_sin=freqs_cis[1],  # [seqlen, head_dim]
                         guidance=guidance_expand,
+                        ref_cu_seqlens_q=ref_cu_seqlens_q,
+                        host_seqlens_q=host_seqlens_q,
                         return_dict=True,
                     )[
                         "x"
@@ -1044,48 +1082,57 @@ class HunyuanVideoPipeline(DiffusionPipeline):
                         step_idx = i // getattr(self.scheduler, "order", 1)
                         callback(step_idx, t, latents)
 
-        if not output_type == "latent":
-            expand_temporal_dim = False
-            if len(latents.shape) == 4:
-                if isinstance(self.vae, AutoencoderKLCausal3D):
-                    latents = latents.unsqueeze(2)
-                    expand_temporal_dim = True
-            elif len(latents.shape) == 5:
-                pass
-            else:
-                raise ValueError(
-                    f"Only support latents with shape (b, c, h, w) or (b, c, f, h, w), but got {latents.shape}."
-                )
+                nvtx.end_range(denoising_loop_rng)
+                if monitor_window_rng is not None and i == monitor_window_step_range[1]:
+                    nvtx.end_range(monitor_window_rng)
+                    monitor_window_rng = None
+        if monitor_window_rng is not None:
+            nvtx.end_range(monitor_window_rng)
 
-            if (
-                hasattr(self.vae.config, "shift_factor")
-                and self.vae.config.shift_factor
-            ):
-                latents = (
-                    latents / self.vae.config.scaling_factor
-                    + self.vae.config.shift_factor
-                )
-            else:
-                latents = latents / self.vae.config.scaling_factor
-
-            with torch.autocast(
-                device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
-            ):
-                if enable_tiling:
-                    self.vae.enable_tiling()
-                    image = self.vae.decode(
-                        latents, return_dict=False, generator=generator
-                    )[0]
+        with nvtx.annotate(message="decode_latents", color="red"):
+            if not output_type == "latent":
+                torch.cuda.empty_cache()
+                expand_temporal_dim = False
+                if len(latents.shape) == 4:
+                    if isinstance(self.vae, AutoencoderKLCausal3D):
+                        latents = latents.unsqueeze(2)
+                        expand_temporal_dim = True
+                elif len(latents.shape) == 5:
+                    pass
                 else:
-                    image = self.vae.decode(
-                        latents, return_dict=False, generator=generator
-                    )[0]
+                    raise ValueError(
+                        f"Only support latents with shape (b, c, h, w) or (b, c, f, h, w), but got {latents.shape}."
+                    )
 
-            if expand_temporal_dim or image.shape[2] == 1:
-                image = image.squeeze(2)
+                if (
+                    hasattr(self.vae.config, "shift_factor")
+                    and self.vae.config.shift_factor
+                ):
+                    latents = (
+                        latents / self.vae.config.scaling_factor
+                        + self.vae.config.shift_factor
+                    )
+                else:
+                    latents = latents / self.vae.config.scaling_factor
 
-        else:
-            image = latents
+                with torch.autocast(
+                    device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
+                ):
+                    if enable_tiling:
+                        self.vae.enable_tiling()
+                        image = self.vae.decode(
+                            latents, return_dict=False, generator=generator
+                        )[0]
+                    else:
+                        image = self.vae.decode(
+                            latents, return_dict=False, generator=generator
+                        )[0]
+
+                if expand_temporal_dim or image.shape[2] == 1:
+                    image = image.squeeze(2)
+
+            else:
+                image = latents
 
         image = (image / 2 + 0.5).clamp(0, 1)
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16

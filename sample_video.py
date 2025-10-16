@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 from loguru import logger
 from datetime import datetime
+import nvtx
 
 from hyvideo.utils.file_utils import save_videos_grid
 from hyvideo.config import parse_args
@@ -11,7 +12,8 @@ from hyvideo.inference import HunyuanVideoSampler
 
 def main():
     args = parse_args()
-    print(args)
+    if 'LOCAL_RANK' not in os.environ or int(os.environ['LOCAL_RANK']) == 0:
+        print(args)
     models_root_path = Path(args.model_base)
     if not models_root_path.exists():
         raise ValueError(f"`models_root` not exists: {models_root_path}")
@@ -27,22 +29,41 @@ def main():
     # Get the updated args
     args = hunyuan_video_sampler.args
 
+    if args.warmup:
+        logger.info("Warmup the model...(3 steps)")
+        hunyuan_video_sampler.predict(
+            prompt=args.prompt, 
+            height=args.video_size[0],
+            width=args.video_size[1],
+            video_length=args.video_length,
+            seed=args.seed,
+            negative_prompt=args.neg_prompt,
+            infer_steps=3,
+            guidance_scale=args.cfg_scale,
+            num_videos_per_prompt=args.num_videos,
+            flow_shift=args.flow_shift,
+            batch_size=args.batch_size,
+            embedded_guidance_scale=args.embedded_cfg_scale
+        )
+
     # Start sampling
     # TODO: batch inference check
-    outputs = hunyuan_video_sampler.predict(
-        prompt=args.prompt, 
-        height=args.video_size[0],
-        width=args.video_size[1],
-        video_length=args.video_length,
-        seed=args.seed,
-        negative_prompt=args.neg_prompt,
-        infer_steps=args.infer_steps,
-        guidance_scale=args.cfg_scale,
-        num_videos_per_prompt=args.num_videos,
-        flow_shift=args.flow_shift,
-        batch_size=args.batch_size,
-        embedded_guidance_scale=args.embedded_cfg_scale
-    )
+    logger.info(f"Start sampling...(infer_steps: {args.infer_steps})")
+    with nvtx.annotate(message="pipeline", color="blue"):
+        outputs = hunyuan_video_sampler.predict(
+            prompt=args.prompt, 
+            height=args.video_size[0],
+            width=args.video_size[1],
+            video_length=args.video_length,
+            seed=args.seed,
+            negative_prompt=args.neg_prompt,
+            infer_steps=args.infer_steps,
+            guidance_scale=args.cfg_scale,
+            num_videos_per_prompt=args.num_videos,
+            flow_shift=args.flow_shift,
+            batch_size=args.batch_size,
+            embedded_guidance_scale=args.embedded_cfg_scale
+        )
     samples = outputs['samples']
     
     # Save samples

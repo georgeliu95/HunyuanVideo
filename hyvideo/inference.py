@@ -3,6 +3,7 @@ import time
 import random
 import functools
 from typing import List, Optional, Tuple, Union
+import math
 
 from pathlib import Path
 from loguru import logger
@@ -37,9 +38,31 @@ except:
     init_distributed_environment = None
 
 
-def parallelize_transformer(pipe):
+def closest_factors(n):
+    if n == 0:
+        return (0, 0)
+    a = math.isqrt(abs(n))
+    while a > 0:
+        if n % a == 0:
+            factor1 = a
+            factor2 = n // a
+            return (factor1, factor2)
+        a -= 1
+    return (1, n)
+
+
+def parallelize_transformer(pipe, attn_type="fa"):
     transformer = pipe.transformer
     original_forward = transformer.forward
+
+    from yunchang.kernels import AttnType
+    attn_map = {
+        "fa3": AttnType.FA3,
+        "fa": AttnType.FA,
+        "torch": AttnType.TORCH,
+        "sage_auto": AttnType.SAGE_AUTO,
+    }
+    transformer.hybrid_attn_type = attn_map[attn_type]
 
     @functools.wraps(transformer.__class__.forward)
     def new_forward(
@@ -52,35 +75,54 @@ def parallelize_transformer(pipe):
         freqs_cos: Optional[torch.Tensor] = None,
         freqs_sin: Optional[torch.Tensor] = None,
         guidance: torch.Tensor = None,  # Guidance for modulation, should be cfg_scale x 1000.
+        ref_cu_seqlens_q: Optional[torch.Tensor] = None,
+        host_seqlens_q: Optional[torch.Tensor] = None,
         return_dict: bool = True,
     ):
+        split_dims = None
         if x.shape[-2] // 2 % get_sequence_parallel_world_size() == 0:
             # try to split x by height
             split_dim = -2
         elif x.shape[-1] // 2 % get_sequence_parallel_world_size() == 0:
             # try to split x by width
             split_dim = -1
+        elif (x.shape[-1] * x.shape[-2] // 4) % get_sequence_parallel_world_size() == 0:
+            split_dim = -1
+            split_dims = [-2, -1]
+            split_scales = closest_factors(get_sequence_parallel_world_size())
         else:
-            raise ValueError(f"Cannot split video sequence into ulysses_degree x ring_degree ({get_sequence_parallel_world_size()}) parts evenly")
+            raise ValueError(f"{x.shape[-1] // 2} Cannot split video sequence into ulysses_degree x ring_degree ({get_sequence_parallel_world_size()}) parts evenly")
 
         # patch sizes for the temporal, height, and width dimensions are 1, 2, and 2.
         temporal_size, h, w = x.shape[2], x.shape[3] // 2, x.shape[4] // 2
 
-        x = torch.chunk(x, get_sequence_parallel_world_size(),dim=split_dim)[get_sequence_parallel_rank()]
+        if isinstance(split_dims, list):
+            x = torch.chunk(x, split_scales[0], dim=split_dims[0])[get_sequence_parallel_rank() // split_scales[1]]
+            x = torch.chunk(x, split_scales[1], dim=split_dims[1])[get_sequence_parallel_rank() % split_scales[1]]
+        else:
+            x = torch.chunk(x, get_sequence_parallel_world_size(),dim=split_dim)[get_sequence_parallel_rank()]
 
         dim_thw = freqs_cos.shape[-1]
         freqs_cos = freqs_cos.reshape(temporal_size, h, w, dim_thw)
-        freqs_cos = torch.chunk(freqs_cos, get_sequence_parallel_world_size(),dim=split_dim - 1)[get_sequence_parallel_rank()]
+        if isinstance(split_dims, list):
+            freqs_cos = torch.chunk(freqs_cos, split_scales[0], dim=split_dims[0]-1)[get_sequence_parallel_rank() // split_scales[1]]
+            freqs_cos = torch.chunk(freqs_cos, split_scales[1], dim=split_dims[1]-1)[get_sequence_parallel_rank() % split_scales[1]]
+        else:
+            freqs_cos = torch.chunk(freqs_cos, get_sequence_parallel_world_size(),dim=split_dim - 1)[get_sequence_parallel_rank()]
         freqs_cos = freqs_cos.reshape(-1, dim_thw)
         dim_thw = freqs_sin.shape[-1]
         freqs_sin = freqs_sin.reshape(temporal_size, h, w, dim_thw)
-        freqs_sin = torch.chunk(freqs_sin, get_sequence_parallel_world_size(),dim=split_dim - 1)[get_sequence_parallel_rank()]
+        if isinstance(split_dims, list):
+            freqs_sin = torch.chunk(freqs_sin, split_scales[0], dim=split_dims[0]-1)[get_sequence_parallel_rank() // split_scales[1]]
+            freqs_sin = torch.chunk(freqs_sin, split_scales[1], dim=split_dims[1]-1)[get_sequence_parallel_rank() % split_scales[1]]
+        else:
+            freqs_sin = torch.chunk(freqs_sin, get_sequence_parallel_world_size(),dim=split_dim - 1)[get_sequence_parallel_rank()]
         freqs_sin = freqs_sin.reshape(-1, dim_thw)
         
         from xfuser.core.long_ctx_attention import xFuserLongContextAttention
         
         for block in transformer.double_blocks + transformer.single_blocks:
-            block.hybrid_seq_parallel_attn = xFuserLongContextAttention()
+            block.hybrid_seq_parallel_attn = xFuserLongContextAttention(attn_type=self.hybrid_attn_type)
 
         output = original_forward(
             x,
@@ -91,12 +133,19 @@ def parallelize_transformer(pipe):
             freqs_cos,
             freqs_sin,
             guidance,
+            ref_cu_seqlens_q,
+            host_seqlens_q,
             return_dict,
         )
 
         return_dict = not isinstance(output, tuple)
         sample = output["x"]
-        sample = get_sp_group().all_gather(sample, dim=split_dim)
+        if isinstance(split_dims, list):
+            sample = get_sp_group().all_gather(sample, dim=-1)
+            sample_shape = sample.shape
+            sample = sample.reshape(*sample_shape[:-2], sample_shape[-2] * split_scales[0], sample_shape[-1] // split_scales[0])
+        else:
+            sample = get_sp_group().all_gather(sample, dim=split_dim)
         output["x"] = sample
         return output
 
@@ -177,6 +226,14 @@ class Inference(object):
         else:
             if device is None:
                 device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device == "cuda":
+            torch.cuda.set_device(torch.device(f"cuda:{os.environ.get('LOCAL_RANK', 0)}"))
+        elif device == "cpu":
+            torch.cuda.set_device(torch.device("cpu"))
+        elif isinstance(device, torch.device):
+            torch.cuda.set_device(device)
+        else:
+            raise ValueError(f"Invalid device: {device}")
 
         parallel_args = {"ulysses_degree": args.ulysses_degree, "ring_degree": args.ring_degree}
 
@@ -200,7 +257,10 @@ class Inference(object):
         if args.use_fp8:
             convert_fp8_linear(model, args.dit_weight, original_dtype=PRECISION_TO_TYPE[args.precision])
         model = model.to(device)
-        model = Inference.load_state_dict(args, model, pretrained_model_path)
+        if args.skip_load_model:
+            pass
+        else:
+            model = Inference.load_state_dict(args, model, pretrained_model_path)
         model.eval()
 
         # ============================= Build extra models ========================
@@ -351,6 +411,7 @@ class Inference(object):
                     f"are: {list(state_dict.keys())}."
                 )
         model.load_state_dict(state_dict, strict=True)
+        logger.info(f"Loaded model from: {model_path}")
         return model
 
     @staticmethod
@@ -406,7 +467,14 @@ class HunyuanVideoSampler(Inference):
 
         self.default_negative_prompt = NEGATIVE_PROMPT
         if self.parallel_args['ulysses_degree'] > 1 or self.parallel_args['ring_degree'] > 1:
-            parallelize_transformer(self.pipeline)
+            parallelize_transformer(self.pipeline, attn_type=args.attn_type)
+        else:
+            if args.attn_type != "fa":
+                attn_type = "flash_attn3" if args.attn_type == "fa3" else args.attn_type
+                for block in self.pipeline.transformer.double_blocks + self.pipeline.transformer.single_blocks:
+                    block.attn_type = attn_type
+
+        self.quant_gemm_type = args.quant_gemm_type
 
     def load_diffusion_pipeline(
         self,
@@ -638,7 +706,10 @@ class HunyuanVideoSampler(Inference):
                 guidance_scale: {guidance_scale}
                       n_tokens: {n_tokens}
                     flow_shift: {flow_shift}
-       embedded_guidance_scale: {embedded_guidance_scale}"""
+       embedded_guidance_scale: {embedded_guidance_scale}
+                     attn_type: {self.pipeline.transformer.double_blocks[0].attn_type}
+                     gemm_type: {self.quant_gemm_type}"""
+       
         logger.debug(debug_str)
 
         # ========================================================================
@@ -663,6 +734,7 @@ class HunyuanVideoSampler(Inference):
             is_progress_bar=True,
             vae_ver=self.args.vae,
             enable_tiling=self.args.vae_tiling,
+            optimize_memcpy=self.args.optimize_memcpy,
         )[0]
         out_dict["samples"] = samples
         out_dict["prompts"] = prompt
