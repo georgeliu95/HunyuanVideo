@@ -1,2 +1,8 @@
 __pycache__
 /ckpts/**/
+nsys/
+ckpts/
+results/
+*.patch
+*.txt
+*.nsys-rep
