@@ -66,7 +66,7 @@ def add_network_args(parser: argparse.ArgumentParser):
         "--quant-gemm-type",
         type=str,
         default=None,
-        choices=["svdquant.int4", "svdquant.nvfp4", "nvfp4", "blockwise.fp8"],
+        choices=["svdquant.int4", "svdquant.nvfp4", "nvfp4", "nvfp4+fp8"],
         help="Quantization type for the transformer.",
     )
     return parser
@@ -244,13 +244,13 @@ def add_inference_args(parser: argparse.ArgumentParser):
     group.add_argument(
         "--model-base",
         type=str,
-        default="ckpts",
+        default=f"{MODEL_BASE}",
         help="Root path of all the models, including t2v models and extra models.",
     )
     group.add_argument(
         "--dit-weight",
         type=str,
-        default="ckpts/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states.pt",
+        default=f"{MODEL_BASE}/hunyuan-video-t2v-720p/transformers/mp_rank_00_model_states.pt",
         help="Path to the HunyuanVideo model. If None, search the model in the args.model_root."
         "1. If it is a file, load the model directly."
         "2. If it is a directory, search the model in the directory. Support two types of models: "

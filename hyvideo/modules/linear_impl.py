@@ -305,6 +305,8 @@ class TrtllmFp8BlockLinear:
         origin_shape = input.shape
         origin_dim = input.dim()
         origin_dtype = input.dtype
+        if origin_dtype != torch.bfloat16:
+            logger.warning(f"Input dtype is {origin_dtype}, forcing the input & output to bfloat16")
         input = input.to(torch.bfloat16)
 
         if input.dim() > 2:
@@ -312,7 +314,6 @@ class TrtllmFp8BlockLinear:
 
         act_input_fp8, input_scale = torch.ops.trtllm.fp8_quantize_1x128(input)
         output = torch.ops.trtllm.fp8_block_scaling_gemm(act_input_fp8, weight, input_scale, weight_scale)
-        output = output.to(origin_dtype)
 
         if bias is not None:
             output = output + bias
@@ -607,6 +608,12 @@ class VflyLinear(torch.nn.Linear):
 @nvtx.annotate(message="replace_linear_layer", color="red")
 def replace_linear_layer(model, quant_gemm_type="svdquant.int4"):
     total_replaced_linear = 0
+    enable_tllm_fp8_ada_blockwise_gemm = False
+    if "+fp8" in quant_gemm_type:
+        quant_gemm_type = quant_gemm_type.replace("+fp8", "")
+        enable_tllm_fp8_ada_blockwise_gemm = True
+        fp8_linear_fn = partial(VflyLinear.from_linear, linear_type="trtllm-fp8-blockwise")
+
     if quant_gemm_type == "svdquant.int4":
         quant_linear_fn = INT4Linear_svdquant
     elif quant_gemm_type == "nvfp4":
@@ -617,15 +624,22 @@ def replace_linear_layer(model, quant_gemm_type="svdquant.int4"):
         quant_linear_fn = nvfp4_linear_fn
     else:
         raise ValueError(f"Invalid quant_gemm_type: {quant_gemm_type}")
+    unreplaced_linear_layers = []
     # Replace linear layer in transformer blocks
-    for block in model.single_blocks:
+    for idx, block in enumerate(model.single_blocks):
         for name, module in block.named_children():
+            if not isinstance(module, torch.nn.Linear):
+                continue
             if name == "linear1" or name == "linear2":
                 wrapped_module = quant_linear_fn(module)
                 setattr(block, name, wrapped_module)
                 total_replaced_linear += 1
-    for block in model.double_blocks:
+            else:
+                unreplaced_linear_layers.append(("single_blocks", idx, name))
+    for idx, block in enumerate(model.double_blocks):
         for name, module in block.named_children():
+            if not isinstance(module, torch.nn.Linear):
+                continue
             if name == "img_mlp":
                 for subname, submodule in module.named_children():
                     if subname == "fc1" or subname == "fc2":
@@ -640,5 +654,15 @@ def replace_linear_layer(model, quant_gemm_type="svdquant.int4"):
                 wrapped_module = quant_linear_fn(module)
                 setattr(block, name, wrapped_module)
                 total_replaced_linear += 1
-    logger.info(f"Have replaced {total_replaced_linear} layers")
+            else:
+                unreplaced_linear_layers.append(("double_blocks", idx, name))
+    logger.info(f"Have replaced {total_replaced_linear} layers with gemm type {quant_gemm_type}")
+    if enable_tllm_fp8_ada_blockwise_gemm:
+        total_replaced_fp8_linear = 0
+        for block_type, idx, name in unreplaced_linear_layers:
+            module = getattr(getattr(model, block_type)[idx], name)
+            wrapped_linear = fp8_linear_fn(module)
+            setattr(getattr(model, block_type)[idx], name, wrapped_linear)
+            total_replaced_fp8_linear += 1
+        logger.info(f"Have replaced {total_replaced_fp8_linear} layers with gemm type fp8 blockwise GEMM (Ada)")
     return model
